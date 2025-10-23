@@ -158,77 +158,100 @@ def preprocess_frame(frame, input_shape, bbox=None):
 def decode_landmarks(outputs, frame_shape, bbox=None):
     """Decode landmarks from model outputs"""
     # MediaPipe pose model outputs multiple tensors
-    # Output 0: (1, 195) - 39 landmarks with visibility
-    # Output 4: (1, 117) - 39 landmarks x,y,z
+    # The outputs seem to be in PIXELS relative to the 256x256 input image, NOT normalized [0,1]
 
     landmarks = None
 
-    # Try output 4 first (117 values = 39 * 3)
-    if len(outputs) > 4:
+    # Try output 0 first (195 values = 39 * 5: x, y, z, visibility, presence)
+    if len(outputs) > 0:
+        output = outputs[0]
+        if output.size == 195:
+            flat = output.flatten()
+            # 39 landmarks with 5 values each, take first 33
+            points_39 = flat.reshape(39, 5)
+            points_33 = points_39[:33]
+
+            # Check if values look like pixel coordinates (should be around 0-256 for 256x256 input)
+            xy = points_33[:, :2]
+            if np.all(xy >= -50) and np.all(xy <= 300):  # Allow some margin beyond 256
+                landmarks = points_33
+                print(f"✓ Using output 0 (195): pixel coordinates relative to 256x256 input")
+            else:
+                print(f"✗ Output 0 xy values unexpected: min={xy.min():.2f}, max={xy.max():.2f}")
+
+    # Try output 4 as fallback (117 values = 39 * 3: x, y, z)
+    if landmarks is None and len(outputs) > 4:
         output = outputs[4]
         if output.size == 117:
             flat = output.flatten()
             # 39 landmarks, take first 33
-            points = flat[:99].reshape(33, 3)
-            landmarks = points
+            points_39 = flat.reshape(39, 3)
+            points_33 = points_39[:33]
 
-    # Fallback: try to find any suitable tensor
-    if landmarks is None:
-        for i, output in enumerate(outputs):
-            shape = output.shape
-            size = np.prod(shape)
-
-            if size >= 99:
-                flat = output.flatten()
-
-                # Try to interpret as 33 landmarks with stride 3 or 5
-                for stride in [5, 4, 3]:
-                    if len(flat) >= 33 * stride:
-                        points = flat[:33 * stride].reshape(33, stride)
-
-                        # Check if values look like normalized coordinates [0, 1]
-                        xy = points[:, :2]
-                        if np.all(xy >= -0.5) and np.all(xy <= 1.5):
-                            landmarks = points
-                            break
-
-                if landmarks is not None:
-                    break
+            # Check if these are pixel coordinates
+            xy = points_33[:, :2]
+            if np.all(xy >= -50) and np.all(xy <= 300):
+                # Add dummy visibility and presence
+                landmarks = np.zeros((33, 5))
+                landmarks[:, :3] = points_33
+                landmarks[:, 3] = 1.0  # visibility
+                landmarks[:, 4] = 1.0  # presence
+                print(f"✓ Using output 4 (117): pixel coordinates relative to 256x256 input")
+            else:
+                print(f"✗ Output 4 xy values unexpected: min={xy.min():.2f}, max={xy.max():.2f}")
 
     if landmarks is None:
         return None
 
-    # Convert to pixel coordinates
+    # Convert from model input space (256x256) to frame coordinates
     if bbox is not None:
-        # Landmarks are relative to the cropped ROI
+        # Landmarks are in pixels relative to the 256x256 model input
+        # We need to map them back to the ROI, then to the full frame
         x1, y1, x2, y2 = bbox
         roi_w = x2 - x1
         roi_h = y2 - y1
+
+        # Scale factor from 256x256 to actual ROI size
+        scale_x = roi_w / 256.0
+        scale_y = roi_h / 256.0
     else:
-        # Landmarks are relative to full frame
+        # No ROI, scale to full frame
         x1, y1 = 0, 0
-        roi_w = frame_shape[1]
-        roi_h = frame_shape[0]
+        scale_x = frame_shape[1] / 256.0
+        scale_y = frame_shape[0] / 256.0
 
     landmarks_px = []
 
     for i in range(33):
-        x = np.clip(landmarks[i, 0], 0, 1) * roi_w + x1
-        y = np.clip(landmarks[i, 1], 0, 1) * roi_h + y1
-
-        # Get visibility if available
+        # Landmarks are in pixels [0-256] relative to the model input
+        x_model = landmarks[i, 0]
+        y_model = landmarks[i, 1]
+        z = landmarks[i, 2] if landmarks.shape[1] > 2 else 0
         visibility = landmarks[i, 3] if landmarks.shape[1] > 3 else 1.0
 
+        # Scale from 256x256 model space to ROI space, then add offset to frame space
+        x_px = x_model * scale_x + x1
+        y_px = y_model * scale_y + y1
+
         landmarks_px.append({
-            'x': int(x),
-            'y': int(y),
+            'x': int(x_px),
+            'y': int(y_px),
+            'z': float(z),
             'visibility': float(visibility)
         })
 
     return landmarks_px
 
-def draw_pose(frame, landmarks):
+def draw_pose(frame, landmarks, bbox=None):
     """Draw pose skeleton on frame"""
+
+    # Draw bounding box if provided (for debugging)
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        cv2.putText(frame, "Person ROI", (x1, y1-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
     if landmarks is None:
         return frame
 
@@ -245,7 +268,7 @@ def draw_pose(frame, landmarks):
                 cv2.line(frame,
                         (start['x'], start['y']),
                         (end['x'], end['y']),
-                        (0, 255, 0), 2)
+                        (0, 255, 0), 3)
 
     # Draw keypoints
     for i, landmark in enumerate(landmarks):
@@ -260,8 +283,8 @@ def draw_pose(frame, landmarks):
             else:  # Legs
                 color = (255, 0, 255)
 
-            cv2.circle(frame, (x, y), 4, color, -1)
-            cv2.circle(frame, (x, y), 5, (255, 255, 255), 1)
+            cv2.circle(frame, (x, y), 5, color, -1)
+            cv2.circle(frame, (x, y), 6, (255, 255, 255), 1)
 
     return frame
 
@@ -375,8 +398,8 @@ def process_video(video_path, model_path, output_path=None, show=False, yolo_mod
                     'landmarks': landmarks
                 })
 
-            # Draw pose
-            annotated_frame = draw_pose(frame.copy(), landmarks)
+            # Draw pose with bbox
+            annotated_frame = draw_pose(frame.copy(), landmarks, bbox)
 
             # Add info
             status = "Detected" if landmarks else "No detection"
